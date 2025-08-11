@@ -1,38 +1,16 @@
-
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
 from datetime import datetime
-from pymongo import MongoClient
-import gridfs
-import certifi
 from io import BytesIO
 
-# ---- TEMPORARY: Test MongoDB model load ----
 from pymongo import MongoClient
+from pymongo.server_api import ServerApi
 import gridfs
-import joblib
 import certifi
-from io import BytesIO
-
-try:
-    mongo_uri = st.secrets["mongo"]["connection_string"]
-    db_name = st.secrets["mongo"]["db_name"]
-    bucket_name = st.secrets["mongo"]["bucket_name"]
-    file_id = st.secrets["mongo"]["model_file_id"]
-
-    client = MongoClient(mongo_uri, tls=True, tlsCAFile=certifi.where())
-    db = client[db_name]
-    fs = gridfs.GridFS(db, bucket_name)
-
-    model_file = fs.get(file_id)
-    model_bytes = BytesIO(model_file.read())
-    model = joblib.load(model_bytes)
-
-    st.success("✅ Model loaded successfully from MongoDB!")
-except Exception as e:
-    st.error(f"❌ Test load failed: {e}")
+from bson import ObjectId
 
 # -----------------------
 # Page config
@@ -41,7 +19,7 @@ st.set_page_config(page_title="NAFLD Predictor", page_icon="🤖", layout="wide"
 st.title("🤖 NAFLD Lifestyle Risk Predictor")
 
 # -----------------------
-# Constants: EXACT 21 FEATURES (order matters)
+# EXACT 21 FEATURES (order matters)
 # -----------------------
 EXPECTED_COLS = [
     'RIAGENDR', 'RIDAGEYR', 'RIDRETH3', 'INDFMPIR',
@@ -62,32 +40,44 @@ RIDRETH3_CODE_MAP = {
 }
 
 # -----------------------
-# Load model from MongoDB GridFS
+# Load model from MongoDB GridFS (uses Streamlit secrets)
 # -----------------------
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_model_from_mongo():
     try:
-        mongo_uri = st.secrets["mongo"]["connection_string"]
-        db_name = st.secrets["mongo"]["db_name"]
-        bucket_name = st.secrets["mongo"]["bucket_name"]
-        file_id = st.secrets["mongo"]["model_file_id"]
+        mongo_uri   = st.secrets["mongo"]["connection_string"]
+        db_name     = st.secrets["mongo"]["db_name"]          # "NAFLD_Models"
+        bucket_name = st.secrets["mongo"]["bucket_name"]      # "fs"
+        file_id_str = st.secrets["mongo"]["model_file_id"]    # e.g. "68999a69058cb88ad9dc1ea0"
 
-        client = MongoClient(mongo_uri, tls=True, tlsCAFile=certifi.where())
+        client = MongoClient(
+            mongo_uri,
+            server_api=ServerApi('1'),
+            tls=True,
+            tlsCAFile=certifi.where(),
+            serverSelectionTimeoutMS=8000,  # fail fast
+        )
+        client.admin.command("ping")  # quick connectivity check
+
         db = client[db_name]
-        fs = gridfs.GridFS(db, bucket_name)
+        fs = gridfs.GridFS(db, collection=bucket_name)
 
-        model_file = fs.get(file_id)
-        model_bytes = BytesIO(model_file.read())
-        model = joblib.load(model_bytes)
+        # Convert string id to ObjectId
+        gridout = fs.get(ObjectId(file_id_str))
+        model = joblib.load(BytesIO(gridout.read()))
         return model
+
     except Exception as e:
         st.error(f"❌ Could not load model from MongoDB: {e}")
         st.stop()
 
-model = load_model_from_mongo()
+# Try to load the model (pressures Mongo only once thanks to cache_resource)
+with st.spinner("Loading model from MongoDB…"):
+    model = load_model_from_mongo()
+st.success("✅ Model loaded from MongoDB")
 
 # -----------------------
-# Sidebar info
+# Sidebar info (optional)
 # -----------------------
 with st.sidebar:
     st.markdown("### Expected features (app)")
@@ -97,9 +87,9 @@ with st.sidebar:
         st.markdown("### Features in model")
         st.write(model_cols)
         if model_cols != EXPECTED_COLS:
-            st.warning("⚠ Model feature list differs from app's features.")
+            st.warning("⚠ Model feature list differs from app's features. Predictions may be off.")
     except Exception:
-        st.info("Model does not expose feature_names_in_ (ok).")
+        st.info("Model does not expose feature_names_in_ (ok if you saved a pipeline).")
 
 # -----------------------
 # UI: Collect inputs
@@ -116,10 +106,10 @@ with c1:
     smoker_ui = st.selectbox("Smoking status", ["No", "Yes"], index=0)
 
 with c2:
-    sleep_hours_ui = st.slider("Sleep duration hours/day", 0.0, 24.0, 8.0, 0.25)
-    work_hours_ui = st.slider("Work schedule duration hours", 0, 24, 8, 1)
+    sleep_hours_ui = st.slider("Sleep duration (hours/day)", 0.0, 24.0, 8.0, 0.25)
+    work_hours_ui = st.slider("Work schedule duration (hours)", 0, 24, 8, 1)
     sleep_disorder_ui = st.selectbox("Sleep Disorder Status", ["No", "Yes"], index=0)
-    pa_mins_ui = st.slider("Physical activity minutes/day", 0, 1440, 30, 5)
+    pa_mins_ui = st.slider("Physical activity (minutes/day)", 0, 1440, 30, 5)
     bmi_ui = st.slider("BMI", 10.0, 60.0, 25.0, 0.1)
 
 with c3:
@@ -132,69 +122,82 @@ with c3:
 st.subheader("Nutrition")
 n1, n2, n3 = st.columns(3)
 with n1:
-    kcal_ui = st.slider("Total kcal", 0, 10000, 2000, 50)
-    prot_ui = st.slider("Protein (g)", 0, 500, 60, 5)
+    kcal_ui = st.slider("Total calorie intake (kcal)", 0, 10000, 2000, 50)
+    prot_ui = st.slider("Total protein intake (grams)", 0, 500, 60, 5)
 with n2:
-    carb_ui = st.slider("Carbs (g)", 0, 1000, 250, 5)
-    sug_ui = st.slider("Sugar (g)", 0, 1000, 40, 5)
+    carb_ui = st.slider("Total carbohydrate intake (grams)", 0, 1000, 250, 5)
+    sug_ui = st.slider("Total sugar intake (grams)", 0, 1000, 40, 5)
 with n3:
-    fib_ui = st.slider("Fiber (g)", 0, 500, 30, 1)
-    fat_ui = st.slider("Fat (g)", 0, 500, 70, 1)
+    fib_ui = st.slider("Total fiber intake (grams)", 0, 500, 30, 1)
+    fat_ui = st.slider("Total fat intake (grams)", 0, 500, 70, 1)
 
 # -----------------------
-# Build row for prediction
+# Build row for prediction (exact order)
 # -----------------------
 row = {
     'RIAGENDR': 1 if gender_ui == "Male" else 2,
     'RIDAGEYR': int(age_ui),
     'RIDRETH3': int(RIDRETH3_CODE_MAP[race_ui]),
     'INDFMPIR': float(income_ui),
+
     'ALQ111': int(alq111_ui),
     'ALQ121': int(alq121_ui),
     'ALQ142': int(alq142_ui),
     'ALQ151': int(alq151_ui),
     'ALQ170': float(alq170_ui),
+
     'Is_Smoker_Cat': 1 if smoker_ui == "Yes" else 0,
+
     'SLQ050': float(sleep_hours_ui),
     'SLQ120': int(work_hours_ui),
     'SLD012': 1 if sleep_disorder_ui == "Yes" else 0,
+
     'DR1TKCAL': int(kcal_ui),
     'DR1TPROT': int(prot_ui),
     'DR1TCARB': int(carb_ui),
     'DR1TSUGR': int(sug_ui),
     'DR1TFIBE': int(fib_ui),
     'DR1TTFAT': int(fat_ui),
+
     'PAQ620': int(pa_mins_ui),
     'BMXBMI': float(bmi_ui),
 }
 X = pd.DataFrame([row], columns=EXPECTED_COLS)
 
 # -----------------------
-# Prediction
+# Predict
 # -----------------------
+st.header("Prediction")
+
+def _pos_idx(classes):
+    try:
+        if 1 in classes: return list(classes).index(1)
+        if True in classes: return list(classes).index(True)
+        if "1" in classes: return list(classes).index("1")
+        nums = [float(c) for c in classes]
+        return int(np.argmax(nums))
+    except Exception:
+        return 1 if classes is not None and len(classes) > 1 else 0
+
 try:
     if hasattr(model, "predict_proba"):
         probs = model.predict_proba(X)
-        pos_idx = 1  # assuming 0 = No, 1 = Yes
-        proba = float(probs[0][pos_idx])
+        classes = getattr(model, "classes_", [0,1])
+        proba = float(probs[0][_pos_idx(classes)])
         yhat = int(model.predict(X)[0])
     else:
         yhat = int(model.predict(X)[0])
         proba = float(yhat)
 except Exception as e:
     st.error(f"❌ Prediction error: {e}")
-    st.write(X)
+    st.write("Inputs sent to model:", X.T.rename(columns={0:'value'}))
     st.stop()
 
-risk_pct = proba * 100
+risk_pct = max(0.0, min(100.0, proba * 100.0))
 risk_label = "High Risk" if risk_pct >= 70 else "Moderate Risk" if risk_pct >= 30 else "Low Risk"
-risk_color = "red" if risk_pct >= 70 else "orange" if risk_pct >= 30 else "green"
 
-st.markdown(
-    f"### Predicted NAFLD Risk: **<span style='color:{risk_color}'>{risk_pct:.2f}% ({risk_label})</span>**",
-    unsafe_allow_html=True
-)
-st.progress(risk_pct / 100)
+st.markdown(f"### Predicted NAFLD Risk: **{risk_pct:.2f}% ({risk_label})**")
+st.progress(risk_pct / 100.0)
 
 st.write("**Inputs sent to the model:**")
-st.dataframe(X.T.rename(columns={0: "value"}))
+st.dataframe(X.T.rename(columns={0:'value'}))
