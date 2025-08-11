@@ -40,7 +40,7 @@ def get_data_from_db():
 def load_model():
     # Load your trained model file here
     # Make sure this file is in your project directory
-    with open('rf_lifestyle_model.pkl', 'rb') as f:
+    with open('rf_lifestyle_model (1).pkl', 'rb') as f:
         return pickle.load(f)
 
 # Load the trained model
