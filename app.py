@@ -1,4 +1,4 @@
-# app.py
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,6 +8,31 @@ from pymongo import MongoClient
 import gridfs
 import certifi
 from io import BytesIO
+
+# ---- TEMPORARY: Test MongoDB model load ----
+from pymongo import MongoClient
+import gridfs
+import joblib
+import certifi
+from io import BytesIO
+
+try:
+    mongo_uri = st.secrets["mongo"]["connection_string"]
+    db_name = st.secrets["mongo"]["db_name"]
+    bucket_name = st.secrets["mongo"]["bucket_name"]
+    file_id = st.secrets["mongo"]["model_file_id"]
+
+    client = MongoClient(mongo_uri, tls=True, tlsCAFile=certifi.where())
+    db = client[db_name]
+    fs = gridfs.GridFS(db, bucket_name)
+
+    model_file = fs.get(file_id)
+    model_bytes = BytesIO(model_file.read())
+    model = joblib.load(model_bytes)
+
+    st.success("✅ Model loaded successfully from MongoDB!")
+except Exception as e:
+    st.error(f"❌ Test load failed: {e}")
 
 # -----------------------
 # Page config
