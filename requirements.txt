@@ -6,3 +6,6 @@ joblib==1.4.2
 pymongo==4.7.3
 dnspython==2.6.1
 certifi==2024.7.4
+plotly==5.23.0
+matplotlib==3.9.1
+fpdf==1.7.2
