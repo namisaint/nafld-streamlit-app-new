@@ -1,10 +1,12 @@
 # app.py
-import streamlit as st
-import pandas as pd
-import numpy as np
-import joblib
+import os
 from io import BytesIO
 from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import joblib
 
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
@@ -17,6 +19,8 @@ from bson import ObjectId
 # -----------------------
 st.set_page_config(page_title="NAFLD Predictor", page_icon="🤖", layout="wide")
 st.title("🤖 NAFLD Lifestyle Risk Predictor")
+
+st.caption("Build: dynamic inputs / MongoDB GridFS model loader / strict feature ordering")
 
 # -----------------------
 # EXACT 21 FEATURES (order matters)
@@ -41,17 +45,11 @@ RIDRETH3_CODE_MAP = {
 
 # -----------------------
 # Load model from MongoDB GridFS (uses Streamlit secrets)
+# st.secrets["mongo"] expected keys:
+#   connection_string, db_name, bucket_name, model_file_id
 # -----------------------
 @st.cache_resource(show_spinner=False)
 def load_model_from_mongo():
-    """
-    Loads a joblib sklearn pipeline from MongoDB GridFS using secrets:
-      [mongo]
-      connection_string = "...mongodb+srv://..."
-      db_name = "NAFLD_Models"
-      bucket_name = "fs"
-      model_file_id = "68999a69058cb88ad9dc1ea0"   # example
-    """
     try:
         mongo_uri   = st.secrets["mongo"]["connection_string"]
         db_name     = st.secrets["mongo"]["db_name"]
@@ -65,23 +63,31 @@ def load_model_from_mongo():
             tlsCAFile=certifi.where(),
             serverSelectionTimeoutMS=8000
         )
+        # Verify connectivity
         client.admin.command("ping")
 
         db = client[db_name]
         fs = gridfs.GridFS(db, collection=bucket_name)
 
-        # Convert string to ObjectId
         gridout = fs.get(ObjectId(file_id_str))
         model = joblib.load(BytesIO(gridout.read()))
         return model
 
     except Exception as e:
-        # Helpful diagnostics: list available files in the bucket
+        # Best-effort diagnostics listing what files exist in the GridFS bucket
+        diag = ""
         try:
-            names = [f.get("filename") for f in db[f"{bucket_name}.files"].find({}, {"filename":1})]
-            st.error(f"❌ Could not load model: {e}\n\nVisible files in {db_name}.{bucket_name}.files: {names}")
+            mongo_uri   = st.secrets["mongo"]["connection_string"]
+            db_name     = st.secrets["mongo"]["db_name"]
+            bucket_name = st.secrets["mongo"]["bucket_name"]
+            client2 = MongoClient(mongo_uri, server_api=ServerApi('1'), tls=True, tlsCAFile=certifi.where())
+            db2 = client2[db_name]
+            names = [doc.get("filename") for doc in db2[f"{bucket_name}.files"].find({}, {"filename": 1}).limit(50)]
+            diag = f"\nVisible files in {db_name}.{bucket_name}.files: {names}"
         except Exception:
-            st.error(f"❌ Could not load model from MongoDB: {e}")
+            pass
+
+        st.error(f"❌ Could not load model from MongoDB: {e}{diag}")
         st.stop()
 
 with st.spinner("Loading model from MongoDB…"):
@@ -89,65 +95,79 @@ with st.spinner("Loading model from MongoDB…"):
 st.success("✅ Model loaded from MongoDB")
 
 # -----------------------
-# Sidebar (optional info)
+# Sidebar (debug/info)
 # -----------------------
 with st.sidebar:
     st.markdown("### Expected features (app)")
     st.write(EXPECTED_COLS)
     try:
-        model_cols = list(model.feature_names_in_)
-        st.markdown("### Features in model")
-        st.write(model_cols)
-        if model_cols != EXPECTED_COLS:
-            st.warning("⚠ Model feature list differs from the app's 21 features.")
+        model_cols = list(getattr(model, "feature_names_in_", []))
+        if model_cols:
+            st.markdown("### Features in model")
+            st.write(model_cols)
+            if model_cols != EXPECTED_COLS:
+                st.warning("⚠ Model feature list/order differs from the app's EXPECTED_COLS.")
+        else:
+            st.info("Model does not expose feature_names_in_ (OK if it's a pipeline).")
     except Exception:
-        st.info("Model does not expose feature_names_in_ (ok if saved as a pipeline).")
+        st.info("Model does not expose feature_names_in_ (OK if it's a pipeline).")
 
 # -----------------------
-# Inputs
+# Inputs (aligned to EXPECTED_COLS)
 # -----------------------
 st.header("Inputs")
 
 c1, c2, c3 = st.columns(3)
 
 with c1:
-    gender_ui = st.selectbox("Gender", ["Male", "Female"], index=0)
-    age_ui = st.slider("Age in years", 0, 120, 40, 1)
-    race_ui = st.selectbox("Race/Ethnicity", list(RIDRETH3_CODE_MAP.keys()), index=2)
-    income_ui = st.slider("Family income ratio", 0.0, 10.0, 2.0, 0.1)
-    smoker_ui = st.selectbox("Smoking status", ["No", "Yes"], index=0)
+    gender_ui = st.selectbox("Gender (NHANES: 1=Male, 2=Female) — RIAGENDR", [1, 2], index=0)
+    age_ui = st.slider("Age in years — RIDAGEYR", 18, 85, 40, 1)
+    race_ui = st.selectbox("Race/Ethnicity — RIDRETH3", list(RIDRETH3_CODE_MAP.keys()), index=2)
+    income_ui = st.slider("Family income ratio — INDFMPIR", 0.0, 10.0, 2.0, 0.1)
+
+    # 0=Never, 1=Former, 2=Current (adjust if your training used a different mapping)
+    smoker_ui = st.selectbox("Smoking status (Is_Smoker_Cat)", [0, 1, 2], index=0,
+                             help="0=Never, 1=Former, 2=Current")
 
 with c2:
-    sleep_hours_ui = st.slider("Sleep duration (hours/day)", 0.0, 24.0, 8.0, 0.25)
-    work_hours_ui = st.slider("Work schedule duration (hours)", 0, 24, 8, 1)
-    sleep_disorder_ui = st.selectbox("Sleep Disorder Status", ["No", "Yes"], index=0)
-    pa_mins_ui = st.slider("Physical activity (minutes/day)", 0, 1440, 30, 5)
-    bmi_ui = st.slider("BMI", 10.0, 60.0, 25.0, 0.1)
+    # SLQ050: Sleep disorder diagnosed? (0/1)
+    sleep_disorder_ui = st.selectbox("Sleep disorder diagnosed? — SLQ050", [0, 1], index=0)
+
+    # SLQ120: Hours usually sleep (float)
+    sleep_hours_ui = st.slider("Sleep duration (hours/day) — SLQ120", 0.0, 24.0, 8.0, 0.25)
+
+    pa_mins_ui = st.slider("Physical activity (minutes/day) — PAQ620", 0, 1440, 30, 5)
+    bmi_ui = st.slider("BMI — BMXBMI", 10.0, 60.0, 25.0, 0.1)
 
 with c3:
-    alq111_ui = st.slider("ALQ111: Alcohol days/week", 0, 7, 0, 1)
-    alq121_ui = st.slider("ALQ121: Alcohol drinks/day", 0, 50, 0, 1)
-    alq142_ui = st.slider("ALQ142: Days drank in past year", 0, 366, 0, 1)
-    alq151_ui = st.slider("ALQ151: Max drinks on any day", 0, 50, 0, 1)
-    alq170_ui = st.slider("ALQ170: Intake freq (drinks/day)", 0.0, 50.0, 0.0, 0.1)
+    alq111_ui = st.slider("Alcohol days/week — ALQ111", 0, 7, 0, 1)
+    alq121_ui = st.slider("Alcohol drinks/day — ALQ121", 0, 50, 0, 1)
+    alq142_ui = st.slider("Days drank in past year — ALQ142", 0, 366, 0, 1)
+    alq151_ui = st.slider("Max drinks on any day — ALQ151", 0, 50, 0, 1)
+    alq170_ui = st.slider("Intake freq (drinks/day) — ALQ170", 0.0, 50.0, 0.0, 0.1)
 
-st.subheader("Nutrition")
+st.subheader("Nutrition (24h recall)")
 n1, n2, n3 = st.columns(3)
 with n1:
-    kcal_ui = st.slider("Total calorie intake (kcal)", 0, 10000, 2000, 50)
-    prot_ui = st.slider("Total protein intake (grams)", 0, 500, 60, 5)
+    kcal_ui = st.slider("Total calories (kcal) — DR1TKCAL", 0, 10000, 2000, 50)
+    prot_ui = st.slider("Protein (g) — DR1TPROT", 0, 500, 60, 5)
 with n2:
-    carb_ui = st.slider("Total carbohydrate intake (grams)", 0, 1000, 250, 5)
-    sug_ui = st.slider("Total sugar intake (grams)", 0, 1000, 40, 5)
+    carb_ui = st.slider("Carbohydrate (g) — DR1TCARB", 0, 1000, 250, 5)
+    sug_ui = st.slider("Sugar (g) — DR1TSUGR", 0, 1000, 40, 5)
 with n3:
-    fib_ui = st.slider("Total fiber intake (grams)", 0, 500, 30, 1)
-    fat_ui = st.slider("Total fat intake (grams)", 0, 500, 70, 1)
+    fib_ui = st.slider("Fibre (g) — DR1TFIBE", 0, 500, 30, 1)
+    fat_ui = st.slider("Total fat (g) — DR1TTFAT", 0, 500, 70, 1)
+
+# SLD012 is included in EXPECTED_COLS. If your training used a specific definition/coding,
+# adjust this widget accordingly. Here we treat it as a simple binary indicator.
+sld012_ui = st.selectbox("SLD012 (binary-coded)", [0, 1], index=0,
+                         help="Set to match your training encoding. If unused in training, remove from EXPECTED_COLS.")
 
 # -----------------------
 # Build row (exact order)
 # -----------------------
 row = {
-    'RIAGENDR': 1 if gender_ui == "Male" else 2,
+    'RIAGENDR': int(gender_ui),
     'RIDAGEYR': int(age_ui),
     'RIDRETH3': int(RIDRETH3_CODE_MAP[race_ui]),
     'INDFMPIR': float(income_ui),
@@ -158,11 +178,11 @@ row = {
     'ALQ151': int(alq151_ui),
     'ALQ170': float(alq170_ui),
 
-    'Is_Smoker_Cat': 1 if smoker_ui == "Yes" else 0,
+    'Is_Smoker_Cat': int(smoker_ui),
 
-    'SLQ050': float(sleep_hours_ui),
-    'SLQ120': int(work_hours_ui),
-    'SLD012': 1 if sleep_disorder_ui == "Yes" else 0,
+    'SLQ050': int(sleep_disorder_ui),    # 0/1
+    'SLQ120': float(sleep_hours_ui),     # hours
+    'SLD012': int(sld012_ui),            # binary (adjust if needed)
 
     'DR1TKCAL': int(kcal_ui),
     'DR1TPROT': int(prot_ui),
@@ -182,11 +202,17 @@ X = pd.DataFrame([row], columns=EXPECTED_COLS)
 st.header("Prediction")
 
 def _pos_idx(classes):
+    """
+    Return the index of the positive class for predict_proba.
+    Tries common cases: 1, True, '1', or max numeric.
+    """
     try:
-        if 1 in classes: return list(classes).index(1)
-        if True in classes: return list(classes).index(True)
-        if "1" in classes: return list(classes).index("1")
-        nums = [float(c) for c in classes]
+        classes_list = list(classes)
+        if 1 in classes_list: return classes_list.index(1)
+        if True in classes_list: return classes_list.index(True)
+        if "1" in classes_list: return classes_list.index("1")
+        # Fallback: choose the class with the max numeric value
+        nums = [float(c) for c in classes_list]
         return int(np.argmax(nums))
     except Exception:
         return 1 if classes is not None and len(classes) > 1 else 0
@@ -202,7 +228,7 @@ try:
         proba = float(yhat)
 except Exception as e:
     st.error(f"❌ Prediction error: {e}")
-    st.write("Inputs sent to model:", X.T.rename(columns={0: 'value'}))
+    st.write("Inputs sent to model (ordered):", X.T.rename(columns={0: 'value'}))
     st.stop()
 
 risk_pct = max(0.0, min(100.0, proba * 100.0))
@@ -211,5 +237,14 @@ risk_label = "High Risk" if risk_pct >= 70 else "Moderate Risk" if risk_pct >= 3
 st.markdown(f"### Predicted NAFLD Risk: **{risk_pct:.2f}% ({risk_label})**")
 st.progress(risk_pct / 100.0)
 
-st.write("**Inputs sent to the model:**")
-st.dataframe(X.T.rename(columns={0: 'value'}))
+# Debug / transparency
+st.caption(f"Run timestamp: {datetime.utcnow().isoformat(timespec='seconds')}Z")
+st.write("**Inputs sent to the model (verify they change as you move sliders):**")
+st.dataframe(X.T.rename(columns={0: 'value'}), use_container_width=True)
+
+st.divider()
+st.markdown(
+    "If predictions seem unresponsive, verify that your trained model's feature order "
+    "matches `EXPECTED_COLS` exactly, and that categorical encodings (e.g., `Is_Smoker_Cat`) "
+    "are the same as in training."
+)
