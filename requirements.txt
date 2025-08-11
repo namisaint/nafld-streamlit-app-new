@@ -7,3 +7,6 @@ joblib
 plotly
 matplotlib
 fpdf
+scikit-learn
+gridfs
+shap
